@@ -1,6 +1,6 @@
 CC      = gcc
-TARGET  = sysinfo_api
-SRC     = sysinfo_api.c
+TARGET  = main
+SRC     = main.c
 
 CFLAGS  = -Wall -Wextra -O2
 LIBS    = -lmicrohttpd -ljansson
