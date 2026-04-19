@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysinfo.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PORT 8080
@@ -33,10 +35,11 @@ void get_hostname(char *buffer, size_t size) {
 }
 
 void get_ram_usage(unsigned long *total, unsigned long *used) {
-  struct sysinfo si;
-  if (sysinfo(&si) == 0) {
-    *total = si.totalram * si.mem_unit;
-    *used = *total - (si.freeram * si.mem_unit);
+  struct sysinfo system_info;
+
+  if (sysinfo(&system_info) == 0) {
+    *total = system_info.totalram * system_info.mem_unit;
+    *used = *total - (system_info.freeram * system_info.mem_unit);
   } else {
     *total = *used = 0;
   }
@@ -47,9 +50,11 @@ void get_cpu_usage(double *cpu) {
 
   static unsigned long long previous_total = 0, previous_idle = 0;
   unsigned long long user, nice, system, idle, iowait, irq, softirq, steal,
-      guest, guest_nice, total;
+      guest, guest_nice;
+  unsigned long long total;
 
   FILE *fp = fopen("/proc/stat", "r");
+
   if (!fp)
     return;
 
@@ -71,22 +76,30 @@ void get_cpu_usage(double *cpu) {
     /* first call: seed, sleep, retry */
     previous_total = total;
     previous_idle = idle;
+
     usleep(200000);
 
     return get_cpu_usage(cpu);
   }
 
-  unsigned long long dt = total - previous_total;
-  unsigned long long di = idle - previous_idle;
+  unsigned long long diff_total = total - previous_total;
+  unsigned long long diff_idle = idle - previous_idle;
+
   previous_total = total;
   previous_idle = idle;
 
-  *cpu = (dt == 0) ? 0.0 : (double)(dt - di) * 100.0 / dt;
+  if (diff_total == 0) {
+    *cpu = 0.0;
+
+    return;
+  }
+
+  *cpu = (double)(diff_total - diff_idle) * 100.0 / diff_total;
 }
 
-void get_network_stats(const char *iface, unsigned long long *rx,
-                       unsigned long long *tx) {
-  *rx = *tx = 0;
+void get_network_stats(const char *iface, unsigned long long *received,
+                       unsigned long long *transmitted) {
+  *received = *transmitted = 0;
 
   FILE *fp = fopen("/proc/net/dev", "r");
   if (!fp)
@@ -97,7 +110,6 @@ void get_network_stats(const char *iface, unsigned long long *rx,
     if (!strstr(line, iface))
       continue;
 
-    /* skip past the colon after the interface name */
     char *colon = strchr(line, ':');
     if (!colon)
       continue;
@@ -105,7 +117,8 @@ void get_network_stats(const char *iface, unsigned long long *rx,
     sscanf(colon + 1,
            "%llu %*u %*u %*u %*u %*u %*u %*u "
            "%llu",
-           rx, tx);
+           received, transmitted);
+
     break;
   }
 
@@ -138,6 +151,7 @@ static int detect_iface_ifaddrs(char *out, size_t size) {
     found = 1;
     break;
   }
+
   freeifaddrs(ifaddr);
   return found ? 0 : -1;
 }
@@ -163,16 +177,18 @@ static int detect_iface_proc(char *out, size_t size) {
     if (sscanf(line, " %63s", name) != 1)
       continue;
 
-    /* skip loopback */
     if (strcmp(name, "lo") == 0)
       continue;
 
     strncpy(out, name, size - 1);
     out[size - 1] = '\0';
     found = 1;
+
     break;
   }
+
   fclose(fp);
+
   return found ? 0 : -1;
 }
 
@@ -181,11 +197,12 @@ static void detect_interface(char *out, size_t size) {
     return;
   if (detect_iface_proc(out, size) == 0)
     return;
+
   strncpy(out, "unknown", size);
 }
 
 /*
- * json builder
+ * JSON builder
  * */
 static char *build_json(const SystemInfo *info) {
   json_t *root = json_object();
@@ -232,13 +249,99 @@ static enum MHD_Result send_response(struct MHD_Connection *conn,
 
 static enum MHD_Result send_error(struct MHD_Connection *conn,
                                   unsigned int status, const char *message) {
-
   json_t *err = json_object();
   json_object_set_new(err, "error", json_integer(status));
   json_object_set_new(err, "message", json_string(message));
   char *body = json_dumps(err, 0);
   json_decref(err);
+
   return send_response(conn, status, "application/json", body, 1);
+}
+
+/*
+ * Stress the cpu/ram and returning its output (using stress-ng)
+ *
+ * Query params (all optional):
+ *   duration  - seconds to run        (default: 5,   max: 60 )
+ *   cpu       - CPU worker threads    (default: 1,   max: 16 )
+ *   vm        - VM/malloc workers     (default: 0,   max: 8  )
+ *   vm_bytes  - MB per VM worker      (default: 128, max: 512)
+ * */
+static enum MHD_Result handle_stress_compute(struct MHD_Connection *conn) {
+  const char *qs;
+  int duration = 5, cpu_workers = 1, vm_workers = 0, vm_bytes = 128;
+
+#define QS_INT(key, var, lo, hi)                                               \
+  qs = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, key);          \
+  if (qs) {                                                                    \
+    int v = atoi(qs);                                                          \
+    var = v<(lo) ? (lo) : v>(hi) ? (hi) : v;                                   \
+  }
+
+  QS_INT("duration", duration, 1, 60)
+  QS_INT("cpu", cpu_workers, 1, 16)
+  QS_INT("vm", vm_workers, 0, 8)
+  QS_INT("vm_bytes", vm_bytes, 16, 512)
+#undef QS_INT
+
+  char command[512];
+  if (vm_workers > 0)
+    snprintf(command, sizeof(command),
+             "stress-ng --cpu %d --vm %d --vm-bytes %dM "
+             "--timeout %ds --metrics-brief 2>&1",
+             cpu_workers, vm_workers, vm_bytes, duration);
+  else
+    snprintf(command, sizeof(command),
+             "stress-ng --cpu %d --timeout %ds --metrics-brief 2>&1",
+             cpu_workers, duration);
+
+  FILE *fp = popen(command, "r");
+  if (!fp)
+    return send_error(conn, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                      "Failed to launch stress-ng");
+
+  char output[4096] = {0};
+  size_t pos = 0, chunk;
+  while (pos < sizeof(output) - 1 &&
+         (chunk = fread(output + pos, 1, sizeof(output) - 1 - pos, fp)) > 0)
+    pos += chunk;
+
+  int exit_status = pclose(fp);
+
+  json_t *root = json_object();
+  json_object_set_new(root, "type", json_string("compute"));
+  json_object_set_new(root, "command", json_string(command));
+  json_object_set_new(root, "duration_s", json_integer(duration));
+  json_object_set_new(root, "cpu_workers", json_integer(cpu_workers));
+  json_object_set_new(root, "vm_workers", json_integer(vm_workers));
+  json_object_set_new(root, "vm_bytes_mb", json_integer(vm_bytes));
+  json_object_set_new(root, "exit_code",
+                      json_integer(WEXITSTATUS(exit_status)));
+  json_object_set_new(root, "output", json_string(output));
+
+  char *body = json_dumps(root, JSON_INDENT(2));
+  json_decref(root);
+
+  return send_response(conn, MHD_HTTP_OK, "application/json", body, 1);
+}
+
+/*
+ * Endpoint to stress request handling, thread scheduling,
+ * socket accept, json allocation and http framing.
+ * */
+static enum MHD_Result handle_stress_ping(struct MHD_Connection *conn) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  long timestamp_ms = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+
+  json_t *root = json_object();
+  json_object_set_new(root, "status", json_string("pong"));
+  json_object_set_new(root, "timestamp_ms", json_integer(timestamp_ms));
+
+  char *body = json_dumps(root, 0);
+  json_decref(root);
+
+  return send_response(conn, MHD_HTTP_OK, "application/json", body, 1);
 }
 
 /*
@@ -254,12 +357,10 @@ handle_request(void *cls, struct MHD_Connection *conn, const char *url,
   (void)upload_data_size;
   (void)con_cls;
 
-  /* onlyGET */
   if (strcmp(method, "GET") != 0)
     return send_error(conn, MHD_HTTP_METHOD_NOT_ALLOWED,
                       "Only GET is supported");
 
-  /* GET /api/sysinfo */
   if (strcmp(url, "/api/sysinfo") == 0) {
     SystemInfo info = {0};
 
@@ -271,14 +372,21 @@ handle_request(void *cls, struct MHD_Connection *conn, const char *url,
                       &info.transmitted_bytes);
 
     char *body = build_json(&info);
+
     return send_response(conn, MHD_HTTP_OK, "application/json", body, 1);
   }
 
-  /* GET /health */
   if (strcmp(url, "/health") == 0) {
     char *body = strdup("{\"status\":\"ok\"}");
+
     return send_response(conn, MHD_HTTP_OK, "application/json", body, 1);
   }
+
+  if (strcmp(url, "/stress/compute") == 0)
+    return handle_stress_compute(conn);
+
+  if (strcmp(url, "/stress/ping") == 0)
+    return handle_stress_ping(conn);
 
   return send_error(conn, MHD_HTTP_NOT_FOUND, "Unknown endpoint");
 }
@@ -293,18 +401,19 @@ int main(void) {
 
   if (!daemon) {
     fprintf(stderr, "Failed to start HTTP daemon on port %d\n", PORT);
+
     return EXIT_FAILURE;
   }
 
-  /* detect interface once at startup */
   char iface[64];
   detect_interface(iface, sizeof(iface));
 
   printf("sysinfo-api listening on http://0.0.0.0:%d\n", PORT);
   printf("  Detected interface : %s\n", iface);
-  printf("  GET /api/sysinfo   — full system info\n");
-  printf("  GET /health        — liveness probe\n");
-  printf("Press ENTER to stop.\n\n");
+  printf("  GET /api/sysinfo\n");
+  printf("  GET /health\n");
+  printf("  GET /stress/compute[?duration=5&cpu=2&vm=1&vm_bytes=128]\n");
+  printf("  GET /stress/ping\n");
 
   getchar();
 
