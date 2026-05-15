@@ -35,14 +35,30 @@ void get_hostname(char *buffer, size_t size) {
 }
 
 void get_ram_usage(unsigned long *total, unsigned long *used) {
-  struct sysinfo system_info;
+  *total = *used = 0;
 
-  if (sysinfo(&system_info) == 0) {
-    *total = system_info.totalram * system_info.mem_unit;
-    *used = *total - (system_info.freeram * system_info.mem_unit);
-  } else {
-    *total = *used = 0;
+  FILE *fp = fopen("/proc/meminfo", "r");
+  if (!fp)
+    return;
+
+  unsigned long mem_total = 0, mem_available = 0;
+  char key[64];
+  unsigned long value;
+
+  while (fscanf(fp, "%63s %lu kB", key, &value) == 2) {
+    if (strcmp(key, "MemTotal:") == 0)
+      mem_total = value;
+    else if (strcmp(key, "MemAvailable:") == 0)
+      mem_available = value;
+
+    if (mem_total && mem_available)
+      break;
   }
+
+  fclose(fp);
+
+  *total = mem_total * 1024;
+  *used  = (mem_total - mem_available) * 1024;
 }
 
 void get_cpu_usage(double *cpu) {
