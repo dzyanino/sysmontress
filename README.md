@@ -27,7 +27,7 @@ Starts the server on port `8080`.
 
 ## Endpoints
 
-### `GET /health`
+### `GET /api/health`
 
 Returns a basic health check.
 
@@ -55,7 +55,7 @@ Returns current system information.
 
 ---
 
-### `GET /stress/compute`
+### `GET /api/stress/compute`
 
 Runs a CPU/memory stress test using `stress-ng` and returns its output.
 
@@ -72,7 +72,7 @@ GET /stress/compute?duration=10&cpu=2&vm=1&vm_bytes=256
 
 ---
 
-### `GET /stress/ping`
+### `GET /api/stress/ping`
 
 Returns a monotonic timestamp. Useful for benchmarking request handling overhead.
 
