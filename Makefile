@@ -1,5 +1,5 @@
 CC      = gcc
-TARGET  = main
+TARGET  = sysmontress
 SRC     = main.c
 
 CFLAGS  = -Wall -Wextra -O2
