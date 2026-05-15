@@ -376,16 +376,16 @@ handle_request(void *cls, struct MHD_Connection *conn, const char *url,
     return send_response(conn, MHD_HTTP_OK, "application/json", body, 1);
   }
 
-  if (strcmp(url, "/health") == 0) {
+  if (strcmp(url, "/api/health") == 0) {
     char *body = strdup("{\"status\":\"ok\"}");
 
     return send_response(conn, MHD_HTTP_OK, "application/json", body, 1);
   }
 
-  if (strcmp(url, "/stress/compute") == 0)
+  if (strcmp(url, "/api/stress/compute") == 0)
     return handle_stress_compute(conn);
 
-  if (strcmp(url, "/stress/ping") == 0)
+  if (strcmp(url, "/api/stress/ping") == 0)
     return handle_stress_ping(conn);
 
   return send_error(conn, MHD_HTTP_NOT_FOUND, "Unknown endpoint");
@@ -411,11 +411,11 @@ int main(void) {
   printf("sysinfo-api listening on http://0.0.0.0:%d\n", PORT);
   printf("  Detected interface : %s\n", iface);
   printf("  GET /api/sysinfo\n");
-  printf("  GET /health\n");
-  printf("  GET /stress/compute[?duration=5&cpu=2&vm=1&vm_bytes=128]\n");
-  printf("  GET /stress/ping\n");
+  printf("  GET /api/health\n");
+  printf("  GET /api/stress/compute[?duration=5&cpu=2&vm=1&vm_bytes=128]\n");
+  printf("  GET /api/stress/ping\n");
 
-  getchar();
+  pause();
 
   MHD_stop_daemon(daemon);
 
